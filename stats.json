@@ -1,0 +1,39 @@
+{
+    "6419235456": {
+        "lifetime": {
+            "wins": 1,
+            "losses": 0,
+            "best_streak": 1,
+            "worst_streak": 0,
+            "current_streak": 1,
+            "markets": {
+                "EUR/USD": {
+                    "wins": 1,
+                    "losses": 0
+                }
+            }
+        },
+        "daily": {
+            "date": "2026-02-22",
+            "wins": 1,
+            "losses": 0,
+            "current_streak": 1
+        }
+    },
+    "8180030013": {
+        "lifetime": {
+            "wins": 0,
+            "losses": 0,
+            "best_streak": 0,
+            "worst_streak": 0,
+            "current_streak": 0,
+            "markets": {}
+        },
+        "daily": {
+            "date": "2026-02-22",
+            "wins": 0,
+            "losses": 0,
+            "current_streak": 0
+        }
+    }
+}

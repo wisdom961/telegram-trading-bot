@@ -1,5 +1,4 @@
 import os
-import time
 import json
 import random
 import string
@@ -50,9 +49,8 @@ subscriptions = load_json(SUB_FILE)
 codes = load_json(CODE_FILE)
 
 # =============================
-# STATE
+# STATE MEMORY
 # =============================
-last_signal_time = {}
 last_signal_market = {}
 
 FOREX_PAIRS = {
@@ -71,7 +69,7 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 expiry_keyboard = ReplyKeyboardMarkup(
-    [["⏱ 5 Minutes"]],
+    [["⏱ 5 Minutes"], ["🔙 Back"]],
     resize_keyboard=True
 )
 
@@ -104,7 +102,7 @@ def has_access(user_id):
     return datetime.now() < expiry
 
 # =============================
-# INITIALIZE USER
+# USER INIT
 # =============================
 def initialize_user(user_id):
     if user_id not in user_stats:
@@ -164,7 +162,7 @@ def record_result(user_id, market, win):
     save_json(STATS_FILE, user_stats)
 
 # =============================
-# ADMIN GENERATE
+# ADMIN CODE GENERATOR
 # =============================
 async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -179,10 +177,10 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     codes[code] = days
     save_json(CODE_FILE, codes)
 
-    await update.message.reply_text(f"Code: {code}\nValid for {days} days")
+    await update.message.reply_text(f"Code: {code} | Valid {days} days")
 
 # =============================
-# ACTIVATE
+# ACTIVATE SUBSCRIPTION
 # =============================
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -253,7 +251,7 @@ async def forex_signal(update, symbol):
     elif ema20 < ema50 and 35 <= rsi <= 55 and bearish:
         direction = "SELL"
     else:
-        await update.message.reply_text("No confirmed setup.")
+        await update.message.reply_text("No confirmed setup.", reply_markup=market_keyboard)
         return
 
     last_signal_market[str(update.effective_user.id)] = symbol
@@ -265,7 +263,7 @@ async def forex_signal(update, symbol):
     )
 
 # =============================
-# MESSAGE HANDLER
+# MAIN MESSAGE HANDLER
 # =============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -280,7 +278,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     check_daily_reset(user_id)
 
     if text == "🚀 Start Trading":
-        await update.message.reply_text("Confirm expiry 👇", reply_markup=expiry_keyboard)
+        await update.message.reply_text("Choose expiry 👇", reply_markup=expiry_keyboard)
 
     elif text == "⏱ 5 Minutes":
         await update.message.reply_text("Choose market 👇", reply_markup=market_keyboard)
@@ -292,13 +290,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         market = last_signal_market.get(user_id)
         if market:
             record_result(user_id, market, True)
-        await update.message.reply_text("Win recorded.", reply_markup=main_keyboard)
+        await update.message.reply_text("Win recorded ✅", reply_markup=main_keyboard)
 
     elif text == "❌ Loss":
         market = last_signal_market.get(user_id)
         if market:
             record_result(user_id, market, False)
-        await update.message.reply_text("Loss recorded.", reply_markup=main_keyboard)
+        await update.message.reply_text("Loss recorded ❌", reply_markup=main_keyboard)
 
     elif text == "📈 Stats":
         lifetime = user_stats[user_id]["lifetime"]
@@ -321,6 +319,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await update.message.reply_text(msg, reply_markup=main_keyboard)
+
+    elif text == "🔙 Back":
+        await update.message.reply_text("Main menu 👇", reply_markup=main_keyboard)
 
 # =============================
 # MAIN

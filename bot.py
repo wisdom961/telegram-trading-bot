@@ -6,7 +6,13 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -51,17 +57,14 @@ def clean_expired():
 # ================= ACCESS CHECK =================
 def has_access(user_id):
     clean_expired()
-
     if int(user_id) == ADMIN_ID:
         return True
-
     if user_id not in subscriptions:
         return False
-
     expiry = datetime.strptime(subscriptions[user_id], "%Y-%m-%d %H:%M:%S")
     return datetime.now() < expiry
 
-# ================= GENERATE CODE (ADMIN) =================
+# ================= ADMIN: GENERATE CODE =================
 async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -132,21 +135,21 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg)
 
-# ================= TIERS BUTTON =================
-tier_keyboard = ReplyKeyboardMarkup(
-    [
-        ["💎 7 Days", "💎 30 Days"],
-        ["💎 90 Days"]
-    ],
-    resize_keyboard=True
-)
-
+# ================= KEYBOARDS =================
 main_keyboard = ReplyKeyboardMarkup(
     [["🚀 Start Trading"]],
     resize_keyboard=True
 )
 
-# ================= STRATEGY =================
+market_keyboard = ReplyKeyboardMarkup(
+    [
+        ["📊 EUR/USD", "📊 GBP/USD"],
+        ["📊 USD/JPY", "📊 GOLD"],
+        ["🔙 Back"]
+    ],
+    resize_keyboard=True
+)
+
 FOREX_PAIRS = {
     "📊 EUR/USD": "EUR/USD",
     "📊 GBP/USD": "GBP/USD",
@@ -154,9 +157,10 @@ FOREX_PAIRS = {
     "📊 GOLD": "XAU/USD",
 }
 
+# ================= FULL PULLBACK CONTINUATION STRATEGY =================
 async def forex_signal(update, symbol):
 
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={TWELVE_KEY}"
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=150&apikey={TWELVE_KEY}"
     data = requests.get(url).json()
 
     if "values" not in data:
@@ -164,27 +168,50 @@ async def forex_signal(update, symbol):
         return
 
     values = list(reversed(data["values"]))
-    closes = [float(c["close"]) for c in values]
 
-    df = pd.DataFrame({"close": closes})
+    closes = [float(c["close"]) for c in values]
+    opens = [float(c["open"]) for c in values]
+
+    df = pd.DataFrame({
+        "close": closes,
+        "open": opens
+    })
+
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
 
     last = df.iloc[-2]
 
-    if last["ema20"] > last["ema50"]:
+    trend_up = last["ema20"] > last["ema50"]
+    trend_down = last["ema20"] < last["ema50"]
+
+    # Pullback near EMA20
+    pullback_zone = abs(last["close"] - last["ema20"]) / last["close"] < 0.002
+
+    bullish = last["close"] > last["open"]
+    bearish = last["close"] < last["open"]
+
+    if trend_up and pullback_zone and bullish:
         direction = "BUY"
-    elif last["ema20"] < last["ema50"]:
+    elif trend_down and pullback_zone and bearish:
         direction = "SELL"
     else:
-        await update.message.reply_text("No setup")
+        await update.message.reply_text(
+            "No pullback continuation setup right now.",
+            reply_markup=market_keyboard
+        )
         return
 
     await update.message.reply_text(
-        f"🚨 SIGNAL\n{symbol}\nDirection: {direction}\nExpiry: 5min"
+        f"🚨 PULLBACK CONTINUATION SIGNAL 🚨\n\n"
+        f"{symbol}\n"
+        f"Direction: {direction}\n"
+        f"Entry: Next candle open\n"
+        f"Expiry: 5 Minutes\n\n"
+        f"⚠️ Enter only at new candle open."
     )
 
-# ================= HANDLER =================
+# ================= MESSAGE HANDLER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = str(update.effective_user.id)
@@ -192,16 +219,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_access(user_id):
         await update.message.reply_text(
-            "🔒 Subscription required.\n\nChoose plan 👇",
-            reply_markup=tier_keyboard
+            "🔒 Subscription required.\n\nUse /activate CODE"
         )
         return
 
     if text == "🚀 Start Trading":
-        await update.message.reply_text("Choose market")
+        await update.message.reply_text("Choose market 👇", reply_markup=market_keyboard)
 
     elif text in FOREX_PAIRS:
         await forex_signal(update, FOREX_PAIRS[text])
+
+    elif text == "🔙 Back":
+        await update.message.reply_text("Main menu 👇", reply_markup=main_keyboard)
 
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,12 +238,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_access(user_id):
         await update.message.reply_text(
-            "🔒 Subscription required.\n\nChoose plan 👇",
-            reply_markup=tier_keyboard
+            "🔒 Activation required.\n\nUse /activate CODE"
         )
         return
 
-    await update.message.reply_text("Welcome", reply_markup=main_keyboard)
+    await update.message.reply_text("Welcome 👇", reply_markup=main_keyboard)
 
 # ================= MAIN =================
 def main():

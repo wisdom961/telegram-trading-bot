@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import requests
 import pandas as pd
 from telegram import Update, ReplyKeyboardMarkup
@@ -15,19 +14,9 @@ if not BOT_TOKEN:
 if not TWELVE_KEY:
     raise RuntimeError("TWELVE_DATA_KEY not set")
 
-# ================= DATABASE =================
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id TEXT PRIMARY KEY,
-    wins INTEGER DEFAULT 0,
-    losses INTEGER DEFAULT 0,
-    active_trade INTEGER DEFAULT 0
-)
-""")
-conn.commit()
+# ================= STATE (Memory Safe) =================
+user_stats = {}
+active_trades = {}
 
 # ================= MARKETS =================
 FOREX_PAIRS = {
@@ -58,19 +47,22 @@ market_keyboard = ReplyKeyboardMarkup(
 )
 
 result_keyboard = ReplyKeyboardMarkup(
-    [["✅ Win", "❌ Loss"]],
+    [["✅ Win", "❌ Loss"], ["🔙 Back"]],
     resize_keyboard=True
 )
 
 # ================= USER INIT =================
 def init_user(user_id):
-    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
+    if user_id not in user_stats:
+        user_stats[user_id] = {
+            "wins": 0,
+            "losses": 0
+        }
 
-# ================= SIGNAL =================
+# ================= STRATEGY =================
 async def forex_signal(update, symbol):
 
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=120&apikey={TWELVE_KEY}"
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=150&apikey={TWELVE_KEY}"
     data = requests.get(url).json()
 
     if "values" not in data:
@@ -78,30 +70,59 @@ async def forex_signal(update, symbol):
         return
 
     values = list(reversed(data["values"]))
-    closes = [float(c["close"]) for c in values]
 
-    df = pd.DataFrame({"close": closes})
+    closes = [float(c["close"]) for c in values]
+    opens = [float(c["open"]) for c in values]
+    highs = [float(c["high"]) for c in values]
+    lows = [float(c["low"]) for c in values]
+
+    df = pd.DataFrame({
+        "close": closes,
+        "open": opens,
+        "high": highs,
+        "low": lows
+    })
+
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
 
-    last = df.iloc[-2]
+    last = df.iloc[-2]  # last closed candle
 
-    if last["ema20"] > last["ema50"]:
+    ema20 = last["ema20"]
+    ema50 = last["ema50"]
+
+    trend_up = ema20 > ema50
+    trend_down = ema20 < ema50
+
+    # Pullback near EMA20 (within 0.2%)
+    pullback_zone = abs(last["close"] - ema20) / last["close"] < 0.002
+
+    bullish = last["close"] > last["open"]
+    bearish = last["close"] < last["open"]
+
+    if trend_up and pullback_zone and bullish:
         direction = "BUY"
-    elif last["ema20"] < last["ema50"]:
+
+    elif trend_down and pullback_zone and bearish:
         direction = "SELL"
+
     else:
-        await update.message.reply_text("No confirmed setup.", reply_markup=market_keyboard)
+        await update.message.reply_text(
+            "No pullback continuation setup right now.",
+            reply_markup=market_keyboard
+        )
         return
 
     user_id = str(update.effective_user.id)
-    cursor.execute("UPDATE users SET active_trade = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    active_trades[user_id] = True
 
     await update.message.reply_text(
-        f"🚨 SIGNAL 🚨\n\n"
-        f"{symbol}\nDirection: {direction}\n"
-        f"Enter next candle\nExpiry: 5 Minutes",
+        f"🚨 PULLBACK CONTINUATION SIGNAL 🚨\n\n"
+        f"{symbol}\n"
+        f"Direction: {direction}\n\n"
+        f"Entry: Next candle open\n"
+        f"Expiry: 5 Minutes\n\n"
+        f"⚠️ Enter only at new candle open.",
         reply_markup=result_keyboard
     )
 
@@ -123,39 +144,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await forex_signal(update, FOREX_PAIRS[text])
 
     elif text == "✅ Win":
-        cursor.execute("SELECT active_trade FROM users WHERE user_id = ?", (user_id,))
-        active = cursor.fetchone()[0]
 
-        if active == 0:
+        if user_id not in active_trades:
             await update.message.reply_text("No active trade.")
             return
 
-        cursor.execute("UPDATE users SET wins = wins + 1, active_trade = 0 WHERE user_id = ?", (user_id,))
-        conn.commit()
+        user_stats[user_id]["wins"] += 1
+        del active_trades[user_id]
 
         await update.message.reply_text("Win recorded ✅", reply_markup=main_keyboard)
 
     elif text == "❌ Loss":
-        cursor.execute("SELECT active_trade FROM users WHERE user_id = ?", (user_id,))
-        active = cursor.fetchone()[0]
 
-        if active == 0:
+        if user_id not in active_trades:
             await update.message.reply_text("No active trade.")
             return
 
-        cursor.execute("UPDATE users SET losses = losses + 1, active_trade = 0 WHERE user_id = ?", (user_id,))
-        conn.commit()
+        user_stats[user_id]["losses"] += 1
+        del active_trades[user_id]
 
         await update.message.reply_text("Loss recorded ❌", reply_markup=main_keyboard)
 
     elif text == "📈 Stats":
-        cursor.execute("SELECT wins, losses FROM users WHERE user_id = ?", (user_id,))
-        wins, losses = cursor.fetchone()
+        wins = user_stats[user_id]["wins"]
+        losses = user_stats[user_id]["losses"]
         total = wins + losses
         winrate = (wins / total * 100) if total > 0 else 0
 
         await update.message.reply_text(
-            f"Trades: {total}\nWins: {wins}\nLosses: {losses}\nWin Rate: {winrate:.2f}%",
+            f"Trades: {total}\n"
+            f"Wins: {wins}\n"
+            f"Losses: {losses}\n"
+            f"Win Rate: {winrate:.2f}%",
             reply_markup=main_keyboard
         )
 

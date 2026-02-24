@@ -37,18 +37,8 @@ def save_json(file, data):
     with open(file, "w") as f:
         json.dump(data, f, indent=4)
 
-user_stats = load_json(STATS_FILE)
+user_data = load_json(STATS_FILE)
 subscriptions = load_json(SUB_FILE)
-
-# ================= STATE =================
-active_trades = {}  # user_id -> {"market": str, "result_recorded": bool}
-
-FOREX_PAIRS = {
-    "📊 EUR/USD": "EUR/USD",
-    "📊 GBP/USD": "GBP/USD",
-    "📊 USD/JPY": "USD/JPY",
-    "📊 GOLD": "XAU/USD",
-}
 
 # ================= KEYBOARDS =================
 main_keyboard = ReplyKeyboardMarkup(
@@ -75,6 +65,13 @@ result_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+FOREX_PAIRS = {
+    "📊 EUR/USD": "EUR/USD",
+    "📊 GBP/USD": "GBP/USD",
+    "📊 USD/JPY": "USD/JPY",
+    "📊 GOLD": "XAU/USD",
+}
+
 # ================= ACCESS =================
 def has_access(user_id):
     if int(user_id) == ADMIN_ID:
@@ -88,23 +85,16 @@ def has_access(user_id):
     return datetime.now() < expiry
 
 # ================= USER INIT =================
-def initialize_user(user_id):
-    if user_id not in user_stats:
-        user_stats[user_id] = {"wins": 0, "losses": 0}
-        save_json(STATS_FILE, user_stats)
+def init_user(user_id):
+    if user_id not in user_data:
+        user_data[user_id] = {
+            "wins": 0,
+            "losses": 0,
+            "active_trade": None
+        }
+        save_json(STATS_FILE, user_data)
 
-# ================= RECORD RESULT =================
-def record_result(user_id, win):
-    initialize_user(user_id)
-
-    if win:
-        user_stats[user_id]["wins"] += 1
-    else:
-        user_stats[user_id]["losses"] += 1
-
-    save_json(STATS_FILE, user_stats)
-
-# ================= SIGNAL ENGINE =================
+# ================= SIGNAL =================
 async def forex_signal(update, symbol):
 
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=120&apikey={TWELVE_KEY}"
@@ -122,35 +112,35 @@ async def forex_signal(update, symbol):
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
 
-    last = df.iloc[-2]       # closed candle
-    prev = df.iloc[-3]       # previous candle
+    last = df.iloc[-2]
 
-    # Trend confirmation
     trend_up = last["ema20"] > last["ema50"]
     trend_down = last["ema20"] < last["ema50"]
 
-    # Candle momentum confirmation
-    bullish_candle = last["close"] > last["open"]
-    bearish_candle = last["close"] < last["open"]
+    bullish = last["close"] > last["open"]
+    bearish = last["close"] < last["open"]
 
-    if trend_up and bullish_candle:
+    if trend_up and bullish:
         direction = "BUY"
-    elif trend_down and bearish_candle:
+    elif trend_down and bearish:
         direction = "SELL"
     else:
         await update.message.reply_text(
-            "Market ranging or weak momentum.\nNo trade.",
+            "Market ranging. No trade.",
             reply_markup=market_keyboard
         )
         return
 
     user_id = str(update.effective_user.id)
-    active_trades[user_id] = {"market": symbol, "result_recorded": False}
+    init_user(user_id)
+
+    user_data[user_id]["active_trade"] = symbol
+    save_json(STATS_FILE, user_data)
 
     await update.message.reply_text(
         f"🚨 SIGNAL 🚨\n\n"
         f"{symbol}\nDirection: {direction}\n"
-        f"Enter at next candle open\nExpiry: 5 Minutes",
+        f"Enter at next candle\nExpiry: 5 Minutes",
         reply_markup=result_keyboard
     )
 
@@ -164,6 +154,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔒 Subscription required.")
         return
 
+    init_user(user_id)
+
     if text == "🚀 Start Trading":
         await update.message.reply_text("Choose expiry 👇", reply_markup=expiry_keyboard)
 
@@ -173,30 +165,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text in FOREX_PAIRS:
         await forex_signal(update, FOREX_PAIRS[text])
 
-    elif text in ["✅ Win", "❌ Loss"]:
+    elif text == "✅ Win":
 
-        if user_id not in active_trades:
+        if user_data[user_id]["active_trade"] is None:
             await update.message.reply_text("No active trade.")
             return
 
-        if active_trades[user_id]["result_recorded"]:
-            await update.message.reply_text("Result already recorded.")
+        user_data[user_id]["wins"] += 1
+        user_data[user_id]["active_trade"] = None
+        save_json(STATS_FILE, user_data)
+
+        await update.message.reply_text("Win recorded ✅", reply_markup=main_keyboard)
+
+    elif text == "❌ Loss":
+
+        if user_data[user_id]["active_trade"] is None:
+            await update.message.reply_text("No active trade.")
             return
 
-        win = text == "✅ Win"
-        record_result(user_id, win)
+        user_data[user_id]["losses"] += 1
+        user_data[user_id]["active_trade"] = None
+        save_json(STATS_FILE, user_data)
 
-        active_trades[user_id]["result_recorded"] = True
-
-        await update.message.reply_text(
-            "Result saved ✅",
-            reply_markup=main_keyboard
-        )
+        await update.message.reply_text("Loss recorded ❌", reply_markup=main_keyboard)
 
     elif text == "📈 Stats":
-        initialize_user(user_id)
-        wins = user_stats[user_id]["wins"]
-        losses = user_stats[user_id]["losses"]
+        wins = user_data[user_id]["wins"]
+        losses = user_data[user_id]["losses"]
         total = wins + losses
         winrate = (wins / total * 100) if total > 0 else 0
 
@@ -214,7 +209,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Welcome!", reply_markup=main_keyboard)))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Welcome 👇", reply_markup=main_keyboard)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("🤖 Bot running...")
     app.run_polling()

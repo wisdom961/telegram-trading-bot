@@ -1,28 +1,13 @@
 import os
-import json
-import random
-import string
+import sqlite3
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    CommandHandler,
-    ContextTypes,
-    filters,
-)
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_KEY = os.getenv("TWELVE_DATA_KEY")
-ADMIN_ID = 6419235456
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -30,28 +15,21 @@ if not BOT_TOKEN:
 if not TWELVE_KEY:
     raise RuntimeError("TWELVE_DATA_KEY not set")
 
-STATS_FILE = "stats.json"
-SUB_FILE = "subscriptions.json"
-CODE_FILE = "codes.json"
-USERS_FILE = "users.json"
+# ================= DATABASE =================
+conn = sqlite3.connect("bot.db", check_same_thread=False)
+cursor = conn.cursor()
 
-# ================= FILE HELPERS =================
-def load_json(file):
-    if os.path.exists(file):
-        with open(file, "r") as f:
-            return json.load(f)
-    return {}
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0,
+    active_trade INTEGER DEFAULT 0
+)
+""")
+conn.commit()
 
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f, indent=4)
-
-user_stats = load_json(STATS_FILE)
-subscriptions = load_json(SUB_FILE)
-
-# ================= STATE =================
-last_signal_market = {}
-
+# ================= MARKETS =================
 FOREX_PAIRS = {
     "📊 EUR/USD": "EUR/USD",
     "📊 GBP/USD": "GBP/USD",
@@ -80,58 +58,16 @@ market_keyboard = ReplyKeyboardMarkup(
 )
 
 result_keyboard = ReplyKeyboardMarkup(
-    [["✅ Win", "❌ Loss"], ["🔙 Back"]],
+    [["✅ Win", "❌ Loss"]],
     resize_keyboard=True
 )
 
-activation_keyboard = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("🔑 Activate Subscription", callback_data="activate_info")]
-    ]
-)
-
-# ================= ACCESS =================
-def has_access(user_id):
-    if int(user_id) == ADMIN_ID:
-        return True
-
-    if user_id not in subscriptions:
-        return False
-
-    expiry = datetime.strptime(subscriptions[user_id], "%Y-%m-%d %H:%M:%S")
-    return datetime.now() < expiry
-
 # ================= USER INIT =================
-def initialize_user(user_id):
-    if user_id not in user_stats:
-        user_stats[user_id] = {
-            "wins": 0,
-            "losses": 0
-        }
-        save_json(STATS_FILE, user_stats)
+def init_user(user_id):
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
 
-# ================= START =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user_id = str(update.effective_user.id)
-
-    if not has_access(user_id):
-        await update.message.reply_text(
-            "👋 Welcome!\n\n"
-            "🔒 You must activate first.\n\n"
-            "Use /activate YOUR_CODE",
-            reply_markup=activation_keyboard
-        )
-        return
-
-    initialize_user(user_id)
-
-    await update.message.reply_text(
-        "🚀 Welcome!\nChoose option below 👇",
-        reply_markup=main_keyboard
-    )
-
-# ================= SIGNAL ENGINE =================
+# ================= SIGNAL =================
 async def forex_signal(update, symbol):
 
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=120&apikey={TWELVE_KEY}"
@@ -159,7 +95,8 @@ async def forex_signal(update, symbol):
         return
 
     user_id = str(update.effective_user.id)
-    last_signal_market[user_id] = True
+    cursor.execute("UPDATE users SET active_trade = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
 
     await update.message.reply_text(
         f"🚨 SIGNAL 🚨\n\n"
@@ -168,17 +105,13 @@ async def forex_signal(update, symbol):
         reply_markup=result_keyboard
     )
 
-# ================= MESSAGE HANDLER =================
+# ================= HANDLER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = str(update.effective_user.id)
     text = update.message.text
 
-    if not has_access(user_id):
-        await update.message.reply_text("🔒 Subscription required.")
-        return
-
-    initialize_user(user_id)
+    init_user(user_id)
 
     if text == "🚀 Start Trading":
         await update.message.reply_text("Choose expiry 👇", reply_markup=expiry_keyboard)
@@ -190,33 +123,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await forex_signal(update, FOREX_PAIRS[text])
 
     elif text == "✅ Win":
+        cursor.execute("SELECT active_trade FROM users WHERE user_id = ?", (user_id,))
+        active = cursor.fetchone()[0]
 
-        if user_id not in last_signal_market:
+        if active == 0:
             await update.message.reply_text("No active trade.")
             return
 
-        user_stats[user_id]["wins"] += 1
-        del last_signal_market[user_id]
-        save_json(STATS_FILE, user_stats)
+        cursor.execute("UPDATE users SET wins = wins + 1, active_trade = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
 
         await update.message.reply_text("Win recorded ✅", reply_markup=main_keyboard)
 
     elif text == "❌ Loss":
+        cursor.execute("SELECT active_trade FROM users WHERE user_id = ?", (user_id,))
+        active = cursor.fetchone()[0]
 
-        if user_id not in last_signal_market:
+        if active == 0:
             await update.message.reply_text("No active trade.")
             return
 
-        user_stats[user_id]["losses"] += 1
-        del last_signal_market[user_id]
-        save_json(STATS_FILE, user_stats)
+        cursor.execute("UPDATE users SET losses = losses + 1, active_trade = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
 
         await update.message.reply_text("Loss recorded ❌", reply_markup=main_keyboard)
 
     elif text == "📈 Stats":
-
-        wins = user_stats[user_id]["wins"]
-        losses = user_stats[user_id]["losses"]
+        cursor.execute("SELECT wins, losses FROM users WHERE user_id = ?", (user_id,))
+        wins, losses = cursor.fetchone()
         total = wins + losses
         winrate = (wins / total * 100) if total > 0 else 0
 
@@ -231,7 +165,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Welcome 👇", reply_markup=main_keyboard)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("🤖 Bot running...")
     app.run_polling()

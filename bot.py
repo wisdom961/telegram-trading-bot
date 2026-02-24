@@ -1,22 +1,14 @@
 import os
 import json
-import random
-import string
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from datetime import datetime
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
     CommandHandler,
     ContextTypes,
-    CallbackQueryHandler,
     filters,
 )
 
@@ -33,8 +25,6 @@ if not TWELVE_KEY:
 
 STATS_FILE = "stats.json"
 SUB_FILE = "subscriptions.json"
-CODE_FILE = "codes.json"
-USERS_FILE = "users.json"
 
 # ================= FILE HELPERS =================
 def load_json(file):
@@ -49,11 +39,9 @@ def save_json(file, data):
 
 user_stats = load_json(STATS_FILE)
 subscriptions = load_json(SUB_FILE)
-codes = load_json(CODE_FILE)
-users_db = load_json(USERS_FILE)
 
 # ================= STATE =================
-last_signal_market = {}
+active_trades = {}  # user_id -> {"market": str, "result_recorded": bool}
 
 FOREX_PAIRS = {
     "📊 EUR/USD": "EUR/USD",
@@ -83,14 +71,8 @@ market_keyboard = ReplyKeyboardMarkup(
 )
 
 result_keyboard = ReplyKeyboardMarkup(
-    [["✅ Win", "❌ Loss"], ["🔙 Back"]],
+    [["✅ Win", "❌ Loss"]],
     resize_keyboard=True
-)
-
-activation_keyboard = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("🔑 Activate Subscription", callback_data="activate_info")]
-    ]
 )
 
 # ================= ACCESS =================
@@ -105,101 +87,22 @@ def has_access(user_id):
     expiry = datetime.strptime(subscriptions[user_id], "%Y-%m-%d %H:%M:%S")
     return datetime.now() < expiry
 
-# ================= FIRST TIME DETECTION =================
-def register_user(user_id):
-    if user_id not in users_db:
-        users_db[user_id] = {
-            "joined": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        save_json(USERS_FILE, users_db)
-        return True
-    return False
+# ================= USER INIT =================
+def initialize_user(user_id):
+    if user_id not in user_stats:
+        user_stats[user_id] = {"wins": 0, "losses": 0}
+        save_json(STATS_FILE, user_stats)
 
-# ================= START COMMAND =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= RECORD RESULT =================
+def record_result(user_id, win):
+    initialize_user(user_id)
 
-    user_id = str(update.effective_user.id)
-    is_new = register_user(user_id)
+    if win:
+        user_stats[user_id]["wins"] += 1
+    else:
+        user_stats[user_id]["losses"] += 1
 
-    if is_new:
-        await update.message.reply_text(
-            "👋 Welcome to the AI Trading Bot!\n\n"
-            "This bot provides structured 5-minute signal analysis.\n\n"
-            "⚠️ You must activate a subscription before using it.",
-            reply_markup=activation_keyboard
-        )
-        return
-
-    if not has_access(user_id):
-        await update.message.reply_text(
-            "🔒 Your subscription is inactive.\n\n"
-            "Use your activation code to unlock access.",
-            reply_markup=activation_keyboard
-        )
-        return
-
-    await update.message.reply_text(
-        "🚀 Welcome back!\n\nChoose an option below 👇",
-        reply_markup=main_keyboard
-    )
-
-# ================= INLINE ACTIVATION INFO =================
-async def activation_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    await query.edit_message_text(
-        "🔑 To activate:\n\n"
-        "1️⃣ Purchase a subscription.\n"
-        "2️⃣ Receive your activation code.\n"
-        "3️⃣ Type:\n\n"
-        "/activate YOUR_CODE"
-    )
-
-# ================= ADMIN CODE GENERATOR =================
-async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /generate <days>")
-        return
-
-    days = int(context.args[0])
-    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    codes[code] = days
-    save_json(CODE_FILE, codes)
-
-    await update.message.reply_text(f"Code: {code} | Valid {days} days")
-
-# ================= ACTIVATE =================
-async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user_id = str(update.effective_user.id)
-
-    if not context.args:
-        await update.message.reply_text("Usage: /activate CODE")
-        return
-
-    code = context.args[0]
-
-    if code not in codes:
-        await update.message.reply_text("❌ Invalid activation code.")
-        return
-
-    days = codes[code]
-    expiry_date = datetime.now() + timedelta(days=days)
-
-    subscriptions[user_id] = expiry_date.strftime("%Y-%m-%d %H:%M:%S")
-    save_json(SUB_FILE, subscriptions)
-
-    del codes[code]
-    save_json(CODE_FILE, codes)
-
-    await update.message.reply_text(
-        f"✅ Subscription active until {expiry_date.strftime('%Y-%m-%d %H:%M:%S')}",
-        reply_markup=main_keyboard
-    )
+    save_json(STATS_FILE, user_stats)
 
 # ================= SIGNAL ENGINE =================
 async def forex_signal(update, symbol):
@@ -219,38 +122,34 @@ async def forex_signal(update, symbol):
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
 
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
-    df["rsi"] = 100 - (100 / (1 + rs))
+    last = df.iloc[-2]       # closed candle
+    prev = df.iloc[-3]       # previous candle
 
-    last = df.iloc[-2]
+    # Trend confirmation
+    trend_up = last["ema20"] > last["ema50"]
+    trend_down = last["ema20"] < last["ema50"]
 
-    ema20 = last["ema20"]
-    ema50 = last["ema50"]
-    rsi = last["rsi"]
+    # Candle momentum confirmation
+    bullish_candle = last["close"] > last["open"]
+    bearish_candle = last["close"] < last["open"]
 
-    confidence = 50
-    if ema20 > ema50:
-        confidence += 20
-    if 45 <= rsi <= 65:
-        confidence += 20
-
-    if ema20 > ema50:
+    if trend_up and bullish_candle:
         direction = "BUY"
-    elif ema20 < ema50:
+    elif trend_down and bearish_candle:
         direction = "SELL"
     else:
-        await update.message.reply_text("No confirmed setup.", reply_markup=market_keyboard)
+        await update.message.reply_text(
+            "Market ranging or weak momentum.\nNo trade.",
+            reply_markup=market_keyboard
+        )
         return
 
-    last_signal_market[str(update.effective_user.id)] = symbol
+    user_id = str(update.effective_user.id)
+    active_trades[user_id] = {"market": symbol, "result_recorded": False}
 
     await update.message.reply_text(
         f"🚨 SIGNAL 🚨\n\n"
         f"{symbol}\nDirection: {direction}\n"
-        f"Confidence: {confidence}%\n"
         f"Enter at next candle open\nExpiry: 5 Minutes",
         reply_markup=result_keyboard
     )
@@ -262,10 +161,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if not has_access(user_id):
-        await update.message.reply_text(
-            "🔒 Subscription required.\nUse /activate YOUR_CODE",
-            reply_markup=activation_keyboard
-        )
+        await update.message.reply_text("🔒 Subscription required.")
         return
 
     if text == "🚀 Start Trading":
@@ -277,19 +173,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text in FOREX_PAIRS:
         await forex_signal(update, FOREX_PAIRS[text])
 
+    elif text in ["✅ Win", "❌ Loss"]:
+
+        if user_id not in active_trades:
+            await update.message.reply_text("No active trade.")
+            return
+
+        if active_trades[user_id]["result_recorded"]:
+            await update.message.reply_text("Result already recorded.")
+            return
+
+        win = text == "✅ Win"
+        record_result(user_id, win)
+
+        active_trades[user_id]["result_recorded"] = True
+
+        await update.message.reply_text(
+            "Result saved ✅",
+            reply_markup=main_keyboard
+        )
+
+    elif text == "📈 Stats":
+        initialize_user(user_id)
+        wins = user_stats[user_id]["wins"]
+        losses = user_stats[user_id]["losses"]
+        total = wins + losses
+        winrate = (wins / total * 100) if total > 0 else 0
+
+        await update.message.reply_text(
+            f"Trades: {total}\n"
+            f"Wins: {wins}\n"
+            f"Losses: {losses}\n"
+            f"Win Rate: {winrate:.2f}%",
+            reply_markup=main_keyboard
+        )
+
     elif text == "🔙 Back":
         await update.message.reply_text("Main menu 👇", reply_markup=main_keyboard)
 
 # ================= MAIN =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("generate", generate))
-    app.add_handler(CommandHandler("activate", activate))
-    app.add_handler(CallbackQueryHandler(activation_info, pattern="activate_info"))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Welcome!", reply_markup=main_keyboard)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     print("🤖 Bot running...")
     app.run_polling()
 

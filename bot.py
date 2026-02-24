@@ -23,7 +23,7 @@ if not BOT_TOKEN:
 if not TWELVE_KEY:
     raise RuntimeError("TWELVE_DATA_KEY not set")
 
-STATS_FILE = "stats.json"
+DATA_FILE = "data.json"
 SUB_FILE = "subscriptions.json"
 
 # ================= FILE HELPERS =================
@@ -37,8 +37,16 @@ def save_json(file, data):
     with open(file, "w") as f:
         json.dump(data, f, indent=4)
 
-user_data = load_json(STATS_FILE)
+user_data = load_json(DATA_FILE)
 subscriptions = load_json(SUB_FILE)
+
+# ================= MARKETS =================
+FOREX_PAIRS = {
+    "📊 EUR/USD": "EUR/USD",
+    "📊 GBP/USD": "GBP/USD",
+    "📊 USD/JPY": "USD/JPY",
+    "📊 GOLD": "XAU/USD",
+}
 
 # ================= KEYBOARDS =================
 main_keyboard = ReplyKeyboardMarkup(
@@ -61,16 +69,9 @@ market_keyboard = ReplyKeyboardMarkup(
 )
 
 result_keyboard = ReplyKeyboardMarkup(
-    [["✅ Win", "❌ Loss"]],
+    [["✅ Win", "❌ Loss"], ["🔙 Back"]],
     resize_keyboard=True
 )
-
-FOREX_PAIRS = {
-    "📊 EUR/USD": "EUR/USD",
-    "📊 GBP/USD": "GBP/USD",
-    "📊 USD/JPY": "USD/JPY",
-    "📊 GOLD": "XAU/USD",
-}
 
 # ================= ACCESS =================
 def has_access(user_id):
@@ -90,11 +91,12 @@ def init_user(user_id):
         user_data[user_id] = {
             "wins": 0,
             "losses": 0,
-            "active_trade": None
+            "active_trade": None,
+            "state": "main"
         }
-        save_json(STATS_FILE, user_data)
+        save_json(DATA_FILE, user_data)
 
-# ================= SIGNAL =================
+# ================= SIGNAL ENGINE =================
 async def forex_signal(update, symbol):
 
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=120&apikey={TWELVE_KEY}"
@@ -126,21 +128,20 @@ async def forex_signal(update, symbol):
         direction = "SELL"
     else:
         await update.message.reply_text(
-            "Market ranging. No trade.",
+            "Market ranging. No strong setup.",
             reply_markup=market_keyboard
         )
         return
 
     user_id = str(update.effective_user.id)
-    init_user(user_id)
-
     user_data[user_id]["active_trade"] = symbol
-    save_json(STATS_FILE, user_data)
+    user_data[user_id]["state"] = "result"
+    save_json(DATA_FILE, user_data)
 
     await update.message.reply_text(
         f"🚨 SIGNAL 🚨\n\n"
         f"{symbol}\nDirection: {direction}\n"
-        f"Enter at next candle\nExpiry: 5 Minutes",
+        f"Enter at next candle open\nExpiry: 5 Minutes",
         reply_markup=result_keyboard
     )
 
@@ -156,39 +157,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     init_user(user_id)
 
+    # ===== MAIN MENU =====
     if text == "🚀 Start Trading":
+        user_data[user_id]["state"] = "expiry"
+        save_json(DATA_FILE, user_data)
         await update.message.reply_text("Choose expiry 👇", reply_markup=expiry_keyboard)
 
+    # ===== EXPIRY MENU =====
     elif text == "⏱ 5 Minutes":
+        user_data[user_id]["state"] = "market"
+        save_json(DATA_FILE, user_data)
         await update.message.reply_text("Choose market 👇", reply_markup=market_keyboard)
 
+    # ===== MARKET MENU =====
     elif text in FOREX_PAIRS:
         await forex_signal(update, FOREX_PAIRS[text])
 
+    # ===== RESULT =====
     elif text == "✅ Win":
-
         if user_data[user_id]["active_trade"] is None:
             await update.message.reply_text("No active trade.")
             return
 
         user_data[user_id]["wins"] += 1
         user_data[user_id]["active_trade"] = None
-        save_json(STATS_FILE, user_data)
+        user_data[user_id]["state"] = "main"
+        save_json(DATA_FILE, user_data)
 
         await update.message.reply_text("Win recorded ✅", reply_markup=main_keyboard)
 
     elif text == "❌ Loss":
-
         if user_data[user_id]["active_trade"] is None:
             await update.message.reply_text("No active trade.")
             return
 
         user_data[user_id]["losses"] += 1
         user_data[user_id]["active_trade"] = None
-        save_json(STATS_FILE, user_data)
+        user_data[user_id]["state"] = "main"
+        save_json(DATA_FILE, user_data)
 
         await update.message.reply_text("Loss recorded ❌", reply_markup=main_keyboard)
 
+    # ===== STATS =====
     elif text == "📈 Stats":
         wins = user_data[user_id]["wins"]
         losses = user_data[user_id]["losses"]
@@ -196,15 +206,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         winrate = (wins / total * 100) if total > 0 else 0
 
         await update.message.reply_text(
-            f"Trades: {total}\n"
-            f"Wins: {wins}\n"
-            f"Losses: {losses}\n"
-            f"Win Rate: {winrate:.2f}%",
+            f"Trades: {total}\nWins: {wins}\nLosses: {losses}\nWin Rate: {winrate:.2f}%",
             reply_markup=main_keyboard
         )
 
+    # ===== BACK BUTTON =====
     elif text == "🔙 Back":
-        await update.message.reply_text("Main menu 👇", reply_markup=main_keyboard)
+        state = user_data[user_id]["state"]
+
+        if state == "market":
+            user_data[user_id]["state"] = "expiry"
+            await update.message.reply_text("Choose expiry 👇", reply_markup=expiry_keyboard)
+
+        elif state == "expiry":
+            user_data[user_id]["state"] = "main"
+            await update.message.reply_text("Main menu 👇", reply_markup=main_keyboard)
+
+        elif state == "result":
+            user_data[user_id]["state"] = "market"
+            await update.message.reply_text("Choose market 👇", reply_markup=market_keyboard)
+
+        else:
+            await update.message.reply_text("Main menu 👇", reply_markup=main_keyboard)
+
+        save_json(DATA_FILE, user_data)
 
 # ================= MAIN =================
 def main():

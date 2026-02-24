@@ -16,7 +16,6 @@ from telegram.ext import (
     MessageHandler,
     CommandHandler,
     ContextTypes,
-    CallbackQueryHandler,
     filters,
 )
 
@@ -49,8 +48,6 @@ def save_json(file, data):
 
 user_stats = load_json(STATS_FILE)
 subscriptions = load_json(SUB_FILE)
-codes = load_json(CODE_FILE)
-users_db = load_json(USERS_FILE)
 
 # ================= STATE =================
 last_signal_market = {}
@@ -98,7 +95,6 @@ def has_access(user_id):
     if int(user_id) == ADMIN_ID:
         return True
 
-    user_id = str(user_id)
     if user_id not in subscriptions:
         return False
 
@@ -114,17 +110,6 @@ def initialize_user(user_id):
         }
         save_json(STATS_FILE, user_stats)
 
-# ================= RECORD RESULT =================
-def record_result(user_id, win):
-    initialize_user(user_id)
-
-    if win:
-        user_stats[user_id]["wins"] += 1
-    else:
-        user_stats[user_id]["losses"] += 1
-
-    save_json(STATS_FILE, user_stats)
-
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -138,6 +123,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=activation_keyboard
         )
         return
+
+    initialize_user(user_id)
 
     await update.message.reply_text(
         "🚀 Welcome!\nChoose option below 👇",
@@ -171,8 +158,8 @@ async def forex_signal(update, symbol):
         await update.message.reply_text("No confirmed setup.", reply_markup=market_keyboard)
         return
 
-    # Save active trade
-    last_signal_market[str(update.effective_user.id)] = symbol
+    user_id = str(update.effective_user.id)
+    last_signal_market[user_id] = True
 
     await update.message.reply_text(
         f"🚨 SIGNAL 🚨\n\n"
@@ -191,6 +178,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔒 Subscription required.")
         return
 
+    initialize_user(user_id)
+
     if text == "🚀 Start Trading":
         await update.message.reply_text("Choose expiry 👇", reply_markup=expiry_keyboard)
 
@@ -206,8 +195,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No active trade.")
             return
 
-        record_result(user_id, True)
+        user_stats[user_id]["wins"] += 1
         del last_signal_market[user_id]
+        save_json(STATS_FILE, user_stats)
 
         await update.message.reply_text("Win recorded ✅", reply_markup=main_keyboard)
 
@@ -217,13 +207,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No active trade.")
             return
 
-        record_result(user_id, False)
+        user_stats[user_id]["losses"] += 1
         del last_signal_market[user_id]
+        save_json(STATS_FILE, user_stats)
 
         await update.message.reply_text("Loss recorded ❌", reply_markup=main_keyboard)
 
     elif text == "📈 Stats":
-        initialize_user(user_id)
+
         wins = user_stats[user_id]["wins"]
         losses = user_stats[user_id]["losses"]
         total = wins + losses
@@ -240,10 +231,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     print("🤖 Bot running...")
     app.run_polling()
 

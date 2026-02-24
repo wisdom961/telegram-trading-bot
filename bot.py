@@ -6,7 +6,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -35,9 +35,24 @@ def save_json(file, data):
 subscriptions = load_json(SUB_FILE)
 codes = load_json(CODE_FILE)
 
+# ================= CLEAN EXPIRED USERS =================
+def clean_expired():
+    now = datetime.now()
+    expired = []
+    for user_id, expiry in subscriptions.items():
+        exp_time = datetime.strptime(expiry, "%Y-%m-%d %H:%M:%S")
+        if now > exp_time:
+            expired.append(user_id)
+    for user_id in expired:
+        del subscriptions[user_id]
+    if expired:
+        save_json(SUB_FILE, subscriptions)
+
 # ================= ACCESS CHECK =================
 def has_access(user_id):
-    if user_id == str(ADMIN_ID):
+    clean_expired()
+
+    if int(user_id) == ADMIN_ID:
         return True
 
     if user_id not in subscriptions:
@@ -46,23 +61,8 @@ def has_access(user_id):
     expiry = datetime.strptime(subscriptions[user_id], "%Y-%m-%d %H:%M:%S")
     return datetime.now() < expiry
 
-# ================= EXPIRY WARNING =================
-async def check_expiry_warning(update, user_id):
-
-    if user_id not in subscriptions:
-        return
-
-    expiry = datetime.strptime(subscriptions[user_id], "%Y-%m-%d %H:%M:%S")
-    remaining = expiry - datetime.now()
-
-    if timedelta(hours=23) < remaining < timedelta(hours=25):
-        await update.message.reply_text(
-            "⚠️ Your subscription expires in less than 24 hours.\nRenew soon."
-        )
-
-# ================= GENERATE CODE (ADMIN ONLY) =================
+# ================= GENERATE CODE (ADMIN) =================
 async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -81,43 +81,72 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_json(CODE_FILE, codes)
 
     await update.message.reply_text(
-        f"✅ Code Generated:\n\n{code}\n\nValid for {days} days.\nOne-time use."
+        f"✅ Code: {code}\nValid: {days} days\nOne-time use"
     )
 
 # ================= ACTIVATE =================
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     user_id = str(update.effective_user.id)
 
     if len(context.args) != 1:
-        await update.message.reply_text("Usage: /activate YOUR_CODE")
+        await update.message.reply_text("Usage: /activate CODE")
         return
 
     code = context.args[0]
 
     if code not in codes:
-        await update.message.reply_text("❌ Invalid code.")
+        await update.message.reply_text("❌ Invalid code")
         return
 
     if codes[code]["used"]:
-        await update.message.reply_text("❌ Code already used.")
+        await update.message.reply_text("❌ Code already used")
         return
 
     days = codes[code]["days"]
     expiry = datetime.now() + timedelta(days=days)
 
     subscriptions[user_id] = expiry.strftime("%Y-%m-%d %H:%M:%S")
-
     codes[code]["used"] = True
 
     save_json(SUB_FILE, subscriptions)
     save_json(CODE_FILE, codes)
 
     await update.message.reply_text(
-        f"✅ Subscription activated!\nExpires: {expiry.strftime('%Y-%m-%d')}"
+        f"✅ Activated\nExpires: {expiry.strftime('%Y-%m-%d')}"
     )
 
-# ================= MARKETS =================
+# ================= ADMIN DASHBOARD =================
+async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    clean_expired()
+
+    if not subscriptions:
+        await update.message.reply_text("No active subscribers.")
+        return
+
+    msg = "📊 Active Subscribers:\n\n"
+    for user_id, expiry in subscriptions.items():
+        msg += f"ID: {user_id}\nExpires: {expiry}\n\n"
+
+    await update.message.reply_text(msg)
+
+# ================= TIERS BUTTON =================
+tier_keyboard = ReplyKeyboardMarkup(
+    [
+        ["💎 7 Days", "💎 30 Days"],
+        ["💎 90 Days"]
+    ],
+    resize_keyboard=True
+)
+
+main_keyboard = ReplyKeyboardMarkup(
+    [["🚀 Start Trading"]],
+    resize_keyboard=True
+)
+
+# ================= STRATEGY =================
 FOREX_PAIRS = {
     "📊 EUR/USD": "EUR/USD",
     "📊 GBP/USD": "GBP/USD",
@@ -125,38 +154,13 @@ FOREX_PAIRS = {
     "📊 GOLD": "XAU/USD",
 }
 
-main_keyboard = ReplyKeyboardMarkup(
-    [["🚀 Start Trading"]],
-    resize_keyboard=True
-)
-
-expiry_keyboard = ReplyKeyboardMarkup(
-    [["⏱ 5 Minutes"], ["🔙 Back"]],
-    resize_keyboard=True
-)
-
-market_keyboard = ReplyKeyboardMarkup(
-    [
-        ["📊 EUR/USD", "📊 GBP/USD"],
-        ["📊 USD/JPY", "📊 GOLD"],
-        ["🔙 Back"]
-    ],
-    resize_keyboard=True
-)
-
-result_keyboard = ReplyKeyboardMarkup(
-    [["🔙 Back"]],
-    resize_keyboard=True
-)
-
-# ================= STRATEGY =================
 async def forex_signal(update, symbol):
 
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={TWELVE_KEY}"
     data = requests.get(url).json()
 
     if "values" not in data:
-        await update.message.reply_text("Market data unavailable.")
+        await update.message.reply_text("Market unavailable")
         return
 
     values = list(reversed(data["values"]))
@@ -173,12 +177,11 @@ async def forex_signal(update, symbol):
     elif last["ema20"] < last["ema50"]:
         direction = "SELL"
     else:
-        await update.message.reply_text("No setup right now.", reply_markup=market_keyboard)
+        await update.message.reply_text("No setup")
         return
 
     await update.message.reply_text(
-        f"🚨 SIGNAL 🚨\n\n{symbol}\nDirection: {direction}\nExpiry: 5 Minutes",
-        reply_markup=result_keyboard
+        f"🚨 SIGNAL\n{symbol}\nDirection: {direction}\nExpiry: 5min"
     )
 
 # ================= HANDLER =================
@@ -189,36 +192,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_access(user_id):
         await update.message.reply_text(
-            "🔒 This bot requires activation.\n\nUse:\n/activate YOUR_CODE"
+            "🔒 Subscription required.\n\nChoose plan 👇",
+            reply_markup=tier_keyboard
         )
         return
 
-    await check_expiry_warning(update, user_id)
-
     if text == "🚀 Start Trading":
-        await update.message.reply_text("Choose expiry 👇", reply_markup=expiry_keyboard)
-
-    elif text == "⏱ 5 Minutes":
-        await update.message.reply_text("Choose market 👇", reply_markup=market_keyboard)
+        await update.message.reply_text("Choose market")
 
     elif text in FOREX_PAIRS:
         await forex_signal(update, FOREX_PAIRS[text])
 
-    elif text == "🔙 Back":
-        await update.message.reply_text("Main menu 👇", reply_markup=main_keyboard)
-
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     user_id = str(update.effective_user.id)
 
     if not has_access(user_id):
         await update.message.reply_text(
-            "👋 Welcome!\n\n🔒 Activation required.\n\nUse:\n/activate YOUR_CODE"
+            "🔒 Subscription required.\n\nChoose plan 👇",
+            reply_markup=tier_keyboard
         )
         return
 
-    await update.message.reply_text("Welcome 👇", reply_markup=main_keyboard)
+    await update.message.reply_text("Welcome", reply_markup=main_keyboard)
 
 # ================= MAIN =================
 def main():
@@ -227,6 +223,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("generate", generate))
     app.add_handler(CommandHandler("activate", activate))
+    app.add_handler(CommandHandler("users", users))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("🤖 Bot running...")

@@ -1,9 +1,9 @@
 import os
-import json
 import random
 import string
 import requests
 import pandas as pd
+import sqlite3
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -19,138 +19,117 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_KEY = os.getenv("TWELVE_DATA_KEY")
 ADMIN_ID = 6419235456
 
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-if not TWELVE_KEY:
-    raise RuntimeError("TWELVE_DATA_KEY not set")
+if not BOT_TOKEN or not TWELVE_KEY:
+    raise RuntimeError("Environment variables missing")
 
-SUB_FILE = "subscriptions.json"
-CODE_FILE = "codes.json"
-STATS_FILE = "stats.json"
+DB = sqlite3.connect("trading_bot.db", check_same_thread=False)
+cursor = DB.cursor()
 
-# ================= FILE HELPERS =================
-def load_json(file):
-    if os.path.exists(file):
-        with open(file, "r") as f:
-            return json.load(f)
-    return {}
+# ================= DATABASE SETUP =================
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    expiry TEXT,
+    balance REAL DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0,
+    trades INTEGER DEFAULT 0,
+    playback_step INTEGER DEFAULT 0
+)
+""")
 
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f, indent=4)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS codes (
+    code TEXT PRIMARY KEY,
+    days INTEGER,
+    used INTEGER
+)
+""")
 
-subscriptions = load_json(SUB_FILE)
-codes = load_json(CODE_FILE)
-stats_data = load_json(STATS_FILE)
+DB.commit()
 
-def save_stats():
-    save_json(STATS_FILE, stats_data)
+# ================= RISK MODEL =================
+RISK_STEPS = {
+    0: 0.02,
+    1: 0.03,
+    2: 0.05
+}
+MAX_PLAYBACK = 2
 
-def get_user_stats(user_id):
-    if user_id not in stats_data:
-        stats_data[user_id] = {
-            "wins": 0,
-            "losses": 0,
-            "trades": 0,
-            "playback_step": 0
-        }
-    return stats_data[user_id]
+# ================= HELPERS =================
+def get_user(user_id):
+    cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    return cursor.fetchone()
 
-# ================= SUBSCRIPTION =================
-def clean_expired():
-    now = datetime.now()
-    expired = []
-    for user_id, expiry in subscriptions.items():
-        exp_time = datetime.strptime(expiry, "%Y-%m-%d %H:%M:%S")
-        if now > exp_time:
-            expired.append(user_id)
-    for user_id in expired:
-        del subscriptions[user_id]
-    if expired:
-        save_json(SUB_FILE, subscriptions)
+def create_user(user_id):
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    DB.commit()
 
 def has_access(user_id):
-    clean_expired()
     if int(user_id) == ADMIN_ID:
         return True
-    if user_id not in subscriptions:
+
+    user = get_user(user_id)
+    if not user or not user[1]:
         return False
-    expiry = datetime.strptime(subscriptions[user_id], "%Y-%m-%d %H:%M:%S")
+
+    expiry = datetime.strptime(user[1], "%Y-%m-%d %H:%M:%S")
     return datetime.now() < expiry
+
+def calculate_trade(balance, step):
+    risk = RISK_STEPS.get(step, 0.02)
+    return round(balance * risk, 2), risk * 100
 
 # ================= ADMIN =================
 async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /generate DAYS")
-        return
-
     days = int(context.args[0])
     code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
-    codes[code] = {"days": days, "used": False}
-    save_json(CODE_FILE, codes)
+    cursor.execute("INSERT INTO codes VALUES (?, ?, 0)", (code, days))
+    DB.commit()
 
-    await update.message.reply_text(
-        f"✅ Code: {code}\nValid: {days} days\nOne-time use"
-    )
+    await update.message.reply_text(f"Code: {code} | {days} days")
 
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /activate CODE")
-        return
-
     code = context.args[0]
 
-    if code not in codes or codes[code]["used"]:
-        await update.message.reply_text("❌ Invalid or used code")
+    cursor.execute("SELECT * FROM codes WHERE code=? AND used=0", (code,))
+    row = cursor.fetchone()
+
+    if not row:
+        await update.message.reply_text("Invalid or used code")
         return
 
-    days = codes[code]["days"]
-    expiry = datetime.now() + timedelta(days=days)
+    expiry = datetime.now() + timedelta(days=row[1])
+    create_user(user_id)
 
-    subscriptions[user_id] = expiry.strftime("%Y-%m-%d %H:%M:%S")
-    codes[code]["used"] = True
+    cursor.execute("UPDATE users SET expiry=? WHERE user_id=?",
+                   (expiry.strftime("%Y-%m-%d %H:%M:%S"), user_id))
+    cursor.execute("UPDATE codes SET used=1 WHERE code=?", (code,))
+    DB.commit()
 
-    save_json(SUB_FILE, subscriptions)
-    save_json(CODE_FILE, codes)
+    await update.message.reply_text(f"Activated until {expiry.strftime('%Y-%m-%d')}")
 
-    await update.message.reply_text(
-        f"✅ Activated\nExpires: {expiry.strftime('%Y-%m-%d')}"
-    )
+# ================= SET BALANCE =================
+async def setbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
 
-# ================= KEYBOARDS =================
-main_keyboard = ReplyKeyboardMarkup(
-    [["🚀 Start Trading"], ["📊 My Stats"]],
-    resize_keyboard=True
-)
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /setbalance 200")
+        return
 
-market_keyboard = ReplyKeyboardMarkup(
-    [
-        ["📊 EUR/USD", "📊 GBP/USD"],
-        ["📊 USD/JPY", "📊 GOLD"],
-        ["🔙 Back"]
-    ],
-    resize_keyboard=True
-)
+    balance = float(context.args[0])
+    create_user(user_id)
 
-result_keyboard = ReplyKeyboardMarkup(
-    [["✅ Win", "❌ Loss"], ["🔙 Back"]],
-    resize_keyboard=True
-)
+    cursor.execute("UPDATE users SET balance=? WHERE user_id=?",
+                   (balance, user_id))
+    DB.commit()
 
-FOREX_PAIRS = {
-    "📊 EUR/USD": "EUR/USD",
-    "📊 GBP/USD": "GBP/USD",
-    "📊 USD/JPY": "USD/JPY",
-    "📊 GOLD": "XAU/USD",
-}
-
-MAX_PLAYBACK = 2
+    await update.message.reply_text(f"Balance set to ${balance}")
 
 # ================= STRATEGY =================
 async def forex_signal(update, symbol):
@@ -159,11 +138,10 @@ async def forex_signal(update, symbol):
     data = requests.get(url).json()
 
     if "values" not in data:
-        await update.message.reply_text("Market unavailable", reply_markup=main_keyboard)
+        await update.message.reply_text("Market unavailable")
         return
 
     values = list(reversed(data["values"]))
-
     closes = [float(c["close"]) for c in values]
     opens = [float(c["open"]) for c in values]
 
@@ -176,26 +154,33 @@ async def forex_signal(update, symbol):
     trend_up = last["ema20"] > last["ema50"]
     trend_down = last["ema20"] < last["ema50"]
     pullback_zone = abs(last["close"] - last["ema20"]) / last["close"] < 0.002
-    bullish = last["close"] > last["open"]
-    bearish = last["close"] < last["open"]
 
-    if trend_up and pullback_zone and bullish:
+    if trend_up and pullback_zone:
         direction = "BUY"
-    elif trend_down and pullback_zone and bearish:
+    elif trend_down and pullback_zone:
         direction = "SELL"
     else:
-        await update.message.reply_text(
-            "No pullback continuation setup right now.",
-            reply_markup=market_keyboard
-        )
+        await update.message.reply_text("No setup now.")
         return
 
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    balance = user[2]
+    step = user[6]
+
+    amount, risk_percent = calculate_trade(balance, step)
+
+    keyboard = ReplyKeyboardMarkup(
+        [["✅ Win", "❌ Loss"], ["🔙 Back"]],
+        resize_keyboard=True
+    )
+
     await update.message.reply_text(
-        f"🚨 PULLBACK CONTINUATION SIGNAL 🚨\n\n"
-        f"{symbol}\nDirection: {direction}\n"
-        f"Entry: Next candle open\nExpiry: 5 Minutes\n\n"
-        f"⚠️ Enter only at new candle open.",
-        reply_markup=result_keyboard
+        f"🚨 SIGNAL 🚨\n\n{symbol}\n{direction}\n\n"
+        f"Risk: {risk_percent}%\n"
+        f"Trade Amount: ${amount}\n"
+        f"Playback Step: {step}",
+        reply_markup=keyboard
     )
 
 # ================= MESSAGE HANDLER =================
@@ -204,82 +189,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     text = update.message.text
 
-    if not has_access(user_id):
-        await update.message.reply_text("🔒 Subscription required.\nUse /activate CODE")
-        return
+    create_user(user_id)
 
-    user_stats = get_user_stats(user_id)
+    if not has_access(user_id):
+        await update.message.reply_text("Subscription required.")
+        return
 
     if text == "🚀 Start Trading":
-        await update.message.reply_text("Choose market 👇", reply_markup=market_keyboard)
+        keyboard = ReplyKeyboardMarkup(
+            [["📊 EUR/USD", "📊 GBP/USD"],
+             ["📊 USD/JPY", "📊 GOLD"]],
+            resize_keyboard=True
+        )
+        await update.message.reply_text("Choose market", reply_markup=keyboard)
 
-    elif text in FOREX_PAIRS:
-        await forex_signal(update, FOREX_PAIRS[text])
+    elif text in ["📊 EUR/USD", "📊 GBP/USD", "📊 USD/JPY", "📊 GOLD"]:
+        symbol_map = {
+            "📊 EUR/USD": "EUR/USD",
+            "📊 GBP/USD": "GBP/USD",
+            "📊 USD/JPY": "USD/JPY",
+            "📊 GOLD": "XAU/USD",
+        }
+        await forex_signal(update, symbol_map[text])
 
     elif text == "✅ Win":
-        user_stats["wins"] += 1
-        user_stats["trades"] += 1
-        user_stats["playback_step"] = 0
-        save_stats()
-
-        await update.message.reply_text("✅ Win Recorded", reply_markup=main_keyboard)
+        cursor.execute("""
+        UPDATE users
+        SET wins=wins+1, trades=trades+1, playback_step=0
+        WHERE user_id=?""", (user_id,))
+        DB.commit()
+        await update.message.reply_text("Win recorded. Playback reset.")
 
     elif text == "❌ Loss":
-        user_stats["losses"] += 1
-        user_stats["trades"] += 1
+        user = get_user(user_id)
+        step = user[6]
 
-        if user_stats["playback_step"] < MAX_PLAYBACK:
-            user_stats["playback_step"] += 1
-            save_stats()
-            await update.message.reply_text(
-                f"❌ Loss Recorded\nPlayback Step {user_stats['playback_step']} of {MAX_PLAYBACK}",
-                reply_markup=main_keyboard
-            )
+        if step < MAX_PLAYBACK:
+            step += 1
         else:
-            user_stats["playback_step"] = 0
-            save_stats()
-            await update.message.reply_text(
-                "❌ Max Playback Reached. Cycle Reset.",
-                reply_markup=main_keyboard
-            )
+            step = 0
 
-    elif text == "📊 My Stats":
-        winrate = 0
-        if user_stats["trades"] > 0:
-            winrate = (user_stats["wins"] / user_stats["trades"]) * 100
+        cursor.execute("""
+        UPDATE users
+        SET losses=losses+1, trades=trades+1, playback_step=?
+        WHERE user_id=?""", (step, user_id))
+        DB.commit()
 
-        await update.message.reply_text(
-            f"📊 Your Stats\n\n"
-            f"Trades: {user_stats['trades']}\n"
-            f"Wins: {user_stats['wins']}\n"
-            f"Losses: {user_stats['losses']}\n"
-            f"Win Rate: {winrate:.2f}%",
-            reply_markup=main_keyboard
-        )
-
-    elif text == "🔙 Back":
-        await update.message.reply_text("Main Menu 👇", reply_markup=main_keyboard)
-
-# ================= START =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-
-    if not has_access(user_id):
-        await update.message.reply_text("🔒 Activation required.\nUse /activate CODE")
-        return
-
-    await update.message.reply_text("Welcome 👇", reply_markup=main_keyboard)
+        await update.message.reply_text(f"Loss recorded. New step: {step}")
 
 # ================= MAIN =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("generate", generate))
     app.add_handler(CommandHandler("activate", activate))
+    app.add_handler(CommandHandler("setbalance", setbalance))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 Bot running...")
+    print("Bot running...")
     app.run_polling()
 
 if __name__ == "__main__":
